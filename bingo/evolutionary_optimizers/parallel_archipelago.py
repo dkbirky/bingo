@@ -11,14 +11,14 @@ import logging
 
 import numpy as np
 import dill
-#from mpi4py import MPI
+from mpi4py import MPI
 
 from .archipelago import Archipelago
 from ..util.log import INFO, DETAILED_INFO
 
 LOGGER = logging.getLogger(__name__)
 
-#MPI.pickle.__init__(dill.dumps, dill.loads)
+MPI.pickle.__init__(dill.dumps, dill.loads)
 
 AGE_UPDATE = 2
 EXIT_NOTIFICATION = 3
