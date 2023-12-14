@@ -9,15 +9,111 @@ that are unique to implicit symbolic regression. Namely, these classes are
 appropriate fitness evaluators, a corresponding training data container, and
 two helper functions.
 """
+import math
 import logging
 import numpy as np
-
+from kneed import KneeLocator
 from ..evaluation.fitness_function import VectorBasedFunction
 from ..evaluation.training_data import TrainingData
+from bingo.symbolic_regression.implicit_regression import ImplicitRegression
+from bingo.symbolic_regression.explicit_regression import ExplicitTrainingData, ExplicitRegression
+from bingo.local_optimizers.scipy_optimizer import ScipyOptimizer
+from bingo.local_optimizers.normalized_marginal_likelihood import NormalizedMarginalLikelihood
 
 LOGGER = logging.getLogger(__name__)
 
-class ImplicitRegression(VectorBasedFunction):
+class MLERegression(VectorBasedFunction):
+    """ Implicit Regression via MLE
+        Approximation technique derived by Nolan Strauss (M').
+    """
+
+    def __init__(self, training_data, required_params=None, 
+                            iters=10, tol=1e-6, order="second"):
+        super().__init__(training_data)
+        self.training_data = training_data
+        self._required_params = required_params
+        self._iters = iters
+        self._tol = tol
+        self._order = order
+
+        if self._order == "first":
+            self.estimate_dx = self.first_order_dx
+            print("First order is not recommended for MLE Regression")
+        elif self._order == "second":
+            self.estimate_dx = self.second_order_dx
+        else:
+            raise ValueError("Supported orders: first, second")
+
+    def evaluate_fitness_vector(self, individual):
+
+        self.eval_count += 1
+        data = self.training_data.x.copy()
+        dx = np.zeros_like(data)
+
+        for i in range(0, self._iters+1):
+            _dx = self.estimate_dx(individual, data)
+            dx += _dx
+            data += _dx
+            if np.abs(_dx).max() < self._tol:
+                break
+
+        ssqe = np.square(np.linalg.norm(dx, axis=1)).sum(axis=0)
+
+        return ssqe
+
+    def first_order_dx(self, individual, data):
+        f, df_dx = individual.evaluate_equation_with_x_gradient_at(x=data)
+        dx = f*df_dx/np.linalg.norm(df_dx, axis=1, ord=2).reshape((-1,1)) 
+        #import pdb;pdb.set_trace()
+        return dx
+
+    def second_order_dx(self, individual, data):
+        vals = self._eval_model(individual, data)
+        f, df_dx, df2_d2x = vals
+        v = df_dx / (1 + 2*df2_d2x)
+        
+        a = np.sum(df2_d2x*np.square(v), axis=0)
+        b = -np.sum(df_dx*v, axis=0)
+        c = f.astype(complex) 
+        """
+        For complex numbers we can try only considering the real component?
+        """
+        l_pos = (-b + np.sqrt(np.square(b) - (4*a*c))) / (2*a)
+        l_neg = (-b - np.sqrt(np.square(b) - (4*a*c))) / (2*a)
+        
+        x_pos = (-l_pos*v).real
+        x_neg = (-l_neg*v).real
+
+        ssqe_pos = np.square(np.linalg.norm(x_pos, axis=0)).sum(axis=0)
+        ssqe_neg = np.square(np.linalg.norm(x_neg, axis=0)).sum(axis=0)
+        ssqe_pos[np.isnan(ssqe_pos)] = np.inf
+        ssqe_neg[np.isnan(ssqe_neg)] = np.inf
+        
+        x_pos, x_neg = x_pos.squeeze().T, x_neg.squeeze().T
+        dx = np.where(x_pos, x_neg, x_pos <= x_neg)
+
+        return dx
+
+    def _eval_model(self, ind, data):
+        vals = []
+        constants = ind.constants
+        if len(constants) == 0:
+            constants = np.zeros((0,1))
+        else:
+            constants = np.array(constants).reshape((-1,1))
+        ind.set_local_optimization_params(constants)
+        ind._simplified_constants = np.array(constants)
+        f = ind.evaluate_equation_at(data).reshape((1,-1,1))
+        partials = [ind.evaluate_equation_with_x_partial_at(
+                            data, [i]*2)[1] for i in \
+                            range(data.shape[1])]
+
+        df_dx = np.stack([partial[0] for partial in partials])
+        df2_d2x = np.stack([partial[1] for partial in partials])
+        return f, np.stack(df_dx), np.stack(df2_d2x)
+
+
+class ImplicitRegressionSMC(VectorBasedFunction):
     """ Implicit Regression, version 2
 
     Fitness of this metric is related to the cos of angle between between
@@ -34,10 +130,12 @@ class ImplicitRegression(VectorBasedFunction):
     required_params : int
         (optional) minimum number of nonzero components of dot
     """
-    def __init__(self, training_data, required_params=None):
-        super().__init__(training_data)
+    def __init__(self, training_data, required_params=None, num_particles=100, mcmc_steps=10, metric='nmlle', std_cap=None):
+        super().__init__(training_data, metric)
         self._required_params = required_params
-
+        self._num_particles = num_particles
+        self._mcmc_steps = mcmc_steps
+        self._std_cap = std_cap
     def evaluate_fitness_vector(self, individual):
         """Evaluates the fitness of an implicit individual
 
@@ -56,6 +154,12 @@ class ImplicitRegression(VectorBasedFunction):
         float
             the fitness of the input Equation individual
         """
+        explicitdata = ExplicitTrainingData(self.training_data.x, np.zeros(self.training_data.x.shape[0]))
+        explicitfitness = ExplicitRegression(explicitdata)
+        explicitoptimizer = ScipyOptimizer(explicitfitness, method='lm',
+                    param_init_bounds=[-10.,10.])
+        explicitoptimizer(individual)
+
         self.eval_count += 1
         _, df_dx = individual.evaluate_equation_with_x_gradient_at(
             x=self.training_data.x)
@@ -69,48 +173,27 @@ class ImplicitRegression(VectorBasedFunction):
         denominator = np.sum(np.abs(dot_product), axis=1)
         normalized_fitness = np.sum(dot_product, axis=1) / denominator
         normalized_fitness[~np.isfinite(denominator)] = np.inf
+        
+        fitness = ImplicitRegression(self.training_data)
+        optimizer = ScipyOptimizer(fitness, method='lm',
+                    param_init_bounds=[-10.,10.])
+        fbf = NormalizedMarginalLikelihood(
+        explicitfitness,
+        explicitoptimizer,
+        num_particles=self._num_particles,
+        mcmc_steps=self._mcmc_steps, std_cap=self._std_cap)
+        if not hasattr(individual, "nmll"):
+            nmll, step_list, vector_mcmc = fbf.__call__(individual)
+            individual.nmll = nmll
         return normalized_fitness
 
     def _enough_parameters_used(self, dot_product):
         n_params_used = (abs(dot_product) > 1e-16).sum(1)
         enough_params_used = np.any(n_params_used >= self._required_params)
         return enough_params_used
-    
-    def get_fitness_vector_and_jacobian(self, individual):
-        r"""Fitness and jacobian evaluation of individual
 
-        fitness = y - f(x) where x and y are in the training_data (i.e.
-        training_data.x and training_data.y) and the function f is defined by
-        the input Equation individual.
 
-        jacobian = [[:math:`df_1/dc_1`, :math:`df_1/dc_2`, ...],
-                    [:math:`df_2/dc_1`, :math:`df_2/dc_2`, ...],
-                    ...]
-        where :math:`f_\#` is the fitness function corresponding with the
-        #th fitness vector entry and :math:`c_\#` is the corresponding
-        constant of the individual
-
-        Parameters
-        ----------
-        individual : Equation
-            individual whose fitness will be evaluated on `training_data`
-            and whose constants will be used for evaluating the jacobian
-
-        Returns
-        -------
-        fitness_vector, jacobian :
-            the vectorized fitness of the individual and
-            the partial derivatives of each fitness function with respect
-            to the individual's constants
-        """
-        self.eval_count += 1
-        f_of_x, df_dc = \
-            individual.evaluate_equation_with_local_opt_gradient_at(
-                    self.training_data.x)
-
-        return f_of_x, df_dc
-
-class ImplicitTrainingData(TrainingData):
+class ImplicitTrainingDataSMC(TrainingData):
     """
     ImplicitTrainingData: Training data of this type contains an input array of
     data (x)  and its time derivative (dx_dt).  Both must be 2 dimensional
@@ -141,14 +224,39 @@ class ImplicitTrainingData(TrainingData):
     points where is doesnt make sense to calculate partial derivatives), they
     should be split in the input `x` by a row of np.nan.
     """
-    def __init__(self, x, dx_dt=None):
+    def __init__(self, x, dx_dt=None, window_size=7, order=3, compute_window=False):
         if x.ndim == 1:
             x = x.reshape([-1, 1])
         if x.ndim > 2:
             raise TypeError('Explicit training x should be 2 dim array')
+        
+        if compute_window:
+            time_deriv_store = []
+            window_size_store = []
+            for window_size in range(3,30,2):
+                window_size_store.append(window_size)
+                data_smoothed, time_deriv, inds = _calculate_partials(x, window_size, 1, edge_effects=False)
+                time_deriv_store.append(time_deriv)
+            diff_store = []
+            window_store = []
+            for i in range(len(time_deriv_store)-1):
+                diff_store.append(np.mean(np.abs(time_deriv_store[i+1][:,0] - time_deriv_store[i][:,0])))
+                window_store.append(window_size_store[i+1])
+            kl = KneeLocator(window_store, diff_store)
+            try:
+                self._window_size = window_store[kl.knee]
+                self._order = 1
+            except:
+                self._window_size = 7
+                self._order = 3
+
+            #print(self._window_size)
+        else:
+            self._window_size = window_size
+            self._order = order
 
         if dx_dt is None:
-            x, dx_dt, _ = _calculate_partials(x)
+            x, dx_dt, _ = _calculate_partials(x, self._window_size, self._order)
         else:
             if dx_dt.ndim != 2:
                 raise TypeError('Implicit training dx_dt must be 2 dim array')
@@ -193,7 +301,7 @@ class ImplicitTrainingData(TrainingData):
         return self._x.shape[0]
 
 
-def _calculate_partials(X):
+def _calculate_partials(X, window_size, order, edge_effects=True):
     """Calculate derivatives with respect to time (first dimension).
 
     Parameters
@@ -218,22 +326,31 @@ def _calculate_partials(X):
         # calculate time derivs using filter
         time_deriv = np.empty(x_seg.shape)
         for i in range(x_seg.shape[1]):
-            time_deriv[:, i] = _savitzky_golay_gram(x_seg[:, i], 7, 3, 1)
+            time_deriv[:, i] = _savitzky_golay_gram(x_seg[:, i], window_size, order, 1)
         # remove edge effects
-        time_deriv = time_deriv[3:-4, :]
-        x_seg = x_seg[3:-4, :]
+        if edge_effects:
+            left = math.floor(window_size/2)
+            right = math.ceil(window_size/2)
+            time_deriv = time_deriv[left:-right, :]
+            x_seg = x_seg[left:-right, :]
 
         if start == 0:
             x_all = np.copy(x_seg)
             time_deriv_all = np.copy(time_deriv)
-            inds_all = np.arange(start + 3, end - 4)
+            if edge_effects:
+                inds_all = np.arange(start + left, end - right)
+            else:
+                inds_all = np.arange(start, end)
         else:
             x_all = np.vstack((x_all, np.copy(x_seg)))
             time_deriv_all = np.vstack((time_deriv_all,
                                         np.copy(time_deriv)))
-
-            inds_all = np.hstack((inds_all,
-                                  np.arange(start + 3, end - 4)))
+            if edge_effects:
+                inds_all = np.hstack((inds_all,
+                                  np.arange(start + left, end - right)))
+            else:
+                inds_all = np.hstack((inds_all,
+                                  np.arange(start, end)))
         start = end + 1
 
     return x_all, time_deriv_all, inds_all

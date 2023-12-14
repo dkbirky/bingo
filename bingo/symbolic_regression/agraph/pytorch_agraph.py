@@ -120,3 +120,19 @@ class PytorchAGraph(AGraph):
             nan_hessian = torch.full(
                 (len(x[0]), 1, *constant_shapes, *constant_shapes), float("nan"))
             return nan_f_of_x.detach().numpy(), nan_hessian.detach().numpy()
+
+    def evaluate_equation_with_x_partial_at(self, x, partial_order):
+        if self._modified:
+            self._update()
+        try:
+            f_of_x, df_dx = evaluation_backend.evaluate_with_partials(
+                self._simplified_command_array, x,
+                self._simplified_constants,
+                partial_order)
+            return f_of_x, df_dx
+        except (ArithmeticError, OverflowError, ValueError,
+                FloatingPointError) as err:
+            LOGGER.warning("%s in stack evaluation/partial-deriv", err)
+            nan_f_of_x = torch.full((len(x[0]), 1), float("nan"))
+            nan_df_dx = torch.full((len(x[0]), len(x)), float("nan"))
+            return nan_f_of_x.detach().numpy(), nan_df_dx.detach().numpy()

@@ -448,8 +448,12 @@ class AGraph(Equation):
         agraph_duplicate._fitness = self._fitness
         agraph_duplicate._fit_set = self._fit_set
         agraph_duplicate._command_array = np.copy(self.command_array)
-        agraph_duplicate._simplified_command_array = \
-            np.copy(self._simplified_command_array)
+        try:
+            agraph_duplicate._simplified_command_array = \
+                np.copy(self._simplified_command_array)
+        except:
+            agraph_duplicate._simplified_command_array = \
+                np.copy(self._command_array)
         agraph_duplicate._simplified_constants = \
             tuple(self._simplified_constants)
         agraph_duplicate._needs_opt = self._needs_opt

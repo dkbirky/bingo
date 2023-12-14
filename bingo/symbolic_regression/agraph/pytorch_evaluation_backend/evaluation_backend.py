@@ -9,7 +9,8 @@ import torch
 from torch.func import hessian as get_hessian
 from torch_eval import evaluate as cpp_evaluate
 from torch_eval import evaluate_with_deriv as cpp_evaluate_with_deriv
-
+from .operator_eval import forward_eval_function
+from torch.autograd import grad
 ENGINE = "pytorch_cpp"
 
 
@@ -37,12 +38,31 @@ def _reshape_output(output, constants, x):
     return np.ones((x_dim, c_dim)) * output
 
 
-def evaluate(cmd_arr, x, constants):
+def get_pytorch_repr(command_array):
+    # TODO see if we can do this more efficiently
+    # TODO this reruns on every eval, how to return just expression?
+
+    def get_expr(X, constants):  # assumes X is column-order
+        expr = []
+
+        for (node, param1, param2) in command_array:
+            expr.append(forward_eval_function(node, param1, param2, X, constants,
+                                              expr))
+
+        return expr[-1]
+
+    return get_expr
+
+
+def evaluate(pytorch_repr, x, constants, final=True):
     if isinstance(x, np.ndarray):
         x = torch.from_numpy(x.T).double()
-    torch_constants = torch.from_numpy(np.array(constants)).double()
-    evaluation = cpp_evaluate(cmd_arr, x, torch_constants).detach().numpy()
-    return _reshape_output(evaluation, constants, x)
+    if final:
+        constants = _get_torch_const(constants, x.size(1))
+    return_eval = get_pytorch_repr(pytorch_repr)(x, constants)
+    if final:
+        return _reshape_output(return_eval.detach().numpy(), constants, x)
+    return return_eval
 
 
 def evaluate_with_derivative(cmd_arr, x, constants, wrt_param_x_or_c):
@@ -69,3 +89,31 @@ def evaluate_with_hessian(cmd_arr, x, constants, wrt_param_x_or_c):
                                                               torch_constants)
 
     return evaluation, hessian
+
+def evaluate_with_partials(pytorch_repr, x, constants, partial_order):
+    if isinstance(x, np.ndarray):
+        x = torch.from_numpy(x.T).double()
+    if not isinstance(constants, np.ndarray):
+        constants = np.array(constants).T
+
+    final_eval = evaluate(pytorch_repr, x, constants, final=True)
+
+    x = x[:, :, None].expand(-1, -1, constants.shape[1])
+    x.requires_grad = True
+    constants = _get_torch_const(constants, x.size(1))
+    eval = evaluate(pytorch_repr, x, constants, final=False)
+
+    partial = eval
+    partials = []
+    for variable in partial_order:
+        try:
+            partial = grad(outputs=partial.sum(), inputs=x,
+                         allow_unused=True,
+                         create_graph=True)[0][variable]
+            if partial is None:
+                partial = torch.zeros_like(x[0])
+        except (IndexError, RuntimeError):
+            partial = torch.zeros_like(x[0])
+        partials.append(partial.detach().numpy())
+
+    return _reshape_output(final_eval, constants, x), partials

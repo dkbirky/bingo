@@ -23,6 +23,11 @@ def mean_squared_error(vector):
     """Calculate the mean squared error of an error vector"""
     return np.mean(np.square(vector))
 
+def nmll_error(vector, nmll):
+    """Calculate the multiobjective fitness using implicit fitness vector and nmll"""
+    vector = np.abs(vector)
+    vector[-1] = nmll
+    return np.mean(vector)
 
 class FitnessFunction(metaclass=ABCMeta):
     """Fitness evaluation metric for individuals.
@@ -82,13 +87,14 @@ class VectorBasedFunction(FitnessFunction, metaclass=ABCMeta):
     """
     def __init__(self, training_data=None, metric="mae"):
         super().__init__(training_data)
-
         if metric in ["mean absolute error", "mae"]:
             self._metric = mean_absolute_error
         elif metric in ["mean squared error", "mse"]:
             self._metric = mean_squared_error
         elif metric in ["root mean squared error", "rmse"]:
             self._metric = root_mean_squared_error
+        elif metric in ["nmll error", "nmlle"]:
+            self._metric = nmll_error
         else:
             raise ValueError("Invalid metric for Fitness Function")
 
@@ -110,7 +116,14 @@ class VectorBasedFunction(FitnessFunction, metaclass=ABCMeta):
             fitness of the individual
         """
         fitness_vector = self.evaluate_fitness_vector(individual)
-        return self._metric(fitness_vector)
+        #print(self._metric)
+        try:
+            return self._metric(fitness_vector)
+        except:
+            try:
+                return self._metric(fitness_vector, individual.norm_nmll)
+            except:
+                return np.inf
 
     @abstractmethod
     def evaluate_fitness_vector(self, individual):

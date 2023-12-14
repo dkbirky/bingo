@@ -78,7 +78,7 @@ class NormalizedMarginalLikelihood(FitnessFunction):
         float
             The *negative* normalized marginal likelihood
         """
-        log_nml = self.optimizer(individual)[0]
+        log_nml, step_list, vector_mcmc = self.optimizer(individual)
         if self._log_scale:
-            return -log_nml
-        return -np.exp(log_nml)
+            return -log_nml, step_list, vector_mcmc
+        return -np.exp(log_nml), step_list, vector_mcmc

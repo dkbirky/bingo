@@ -1,6 +1,7 @@
 import numpy as np
 from scipy.stats import multivariate_normal as mvn
 from scipy.stats import invgamma
+from scipy.stats import uniform
 
 from smcpy.mcmc.vector_mcmc import VectorMCMC
 from smcpy.mcmc.vector_mcmc_kernel import VectorMCMCKernel
@@ -8,7 +9,7 @@ from smcpy import AdaptiveSampler
 from smcpy import ImproperUniform
 
 from .local_optimizer import LocalOptimizer
-
+np.random.seed(123)
 
 class SmcpyOptimizer(LocalOptimizer):
     """An optimizer that uses SMCPy for probabilistic parameter calibration
@@ -59,6 +60,7 @@ class SmcpyOptimizer(LocalOptimizer):
         std=None,
         num_multistarts=1,
         uniformly_weighted_proposal=True,
+        std_cap=None,
     ):
 
         self._num_particles = num_particles
@@ -69,8 +71,9 @@ class SmcpyOptimizer(LocalOptimizer):
         self._uniformly_weighted_proposal = uniformly_weighted_proposal
         self._objective_fn = objective_fn
         self._deterministic_optimizer = deterministic_optimizer
-
+        self._std_cap = std_cap
         self._norm_phi = self._calculate_norm_phi()
+        self.std_set = 0.5
 
     def _calculate_norm_phi(self):
         num_observations = len(self.training_data)
@@ -140,18 +143,27 @@ class SmcpyOptimizer(LocalOptimizer):
             proposal = self._generate_proposal_samples(
                 individual, self._num_particles
             )
+            if self._std_cap is not None:
+                proposal[0]['std_dev'] = uniform(0,self._std_cap).rvs(self._num_particles)
         except (ValueError, np.linalg.LinAlgError, RuntimeError) as e:
+            #print(e)
             return np.nan, None, None
-
+        
         param_names = self._get_parameter_names(individual)
-        priors = [ImproperUniform() for _ in range(len(param_names))]
-        if self._std is None:
+        if self._std_cap is not None:
+            priors = [ImproperUniform() for _ in range(len(param_names))] + \
+                    [ImproperUniform(0, self._std_cap)]
+            param_names.append('std_dev')
+        else:
+            priors = [ImproperUniform() for _ in range(len(param_names))]
             priors.append(ImproperUniform(0, None))
             param_names.append("std_dev")
 
         vector_mcmc = VectorMCMC(
             lambda x: self.evaluate_model(x, individual),
-            np.zeros(len(self.training_data)),
+            #np.ones(self.training_data.x.shape[0])*np.mean(individual.evaluate_equation_at(self.training_data.x)),
+            np.zeros(self.training_data.x.shape[0]),
+            #np.random.normal(0, self.std_set, self.training_data.x.shape[0]),
             priors,
             log_like_args=self._std,
         )
@@ -159,6 +171,11 @@ class SmcpyOptimizer(LocalOptimizer):
         smc = AdaptiveSampler(mcmc_kernel)
 
         try:
+            #proposal[0]['p0'] = np.random.normal(1.0, 0.1, self._num_particles)
+            #proposal[0]['p1'] = np.random.normal(1.0, 0.1, self._num_particles)
+            #proposal[0]['p2'] = np.random.normal(1.0, 0.1, self._num_particles)
+            #proposal[0]['std_dev'] = np.random.normal(0.0, 0.0, self._num_particles)
+            #print(proposal)
             step_list, marginal_log_likes = smc.sample(
                 self._num_particles,
                 self._mcmc_steps,
@@ -168,7 +185,7 @@ class SmcpyOptimizer(LocalOptimizer):
                 progress_bar=False,
             )
         except (ValueError, np.linalg.LinAlgError, ZeroDivisionError) as e:
-            # print(e)
+            #print(e)
             return np.nan, None, None
 
         max_idx = np.argmax(step_list[-1].log_likes)
@@ -178,6 +195,8 @@ class SmcpyOptimizer(LocalOptimizer):
         log_nml = (
             marginal_log_likes[-1] - marginal_log_likes[smc.req_phi_index[0]]
         )
+        #print(smc.req_phi_index[0])
+        #print(marginal_log_likes)
 
         return log_nml, step_list, vector_mcmc
 
@@ -210,23 +229,27 @@ class SmcpyOptimizer(LocalOptimizer):
                 )
 
             pdf, samples = self._get_samples_and_pdf(param_dists, num_samples)
+            #print(pdf, samples)
 
         if self._std is None:
             len_data = len(self.training_data)
-            scale_data = np.sqrt(
-                np.mean(np.square(self.training_data.y))
-            )  # TODO can we do this differently without knowing what the training data is?
+            #scale_data = np.sqrt(
+            #    np.mean(np.square(np.ones(self.training_data.x.shape[0])*np.mean(individual.evaluate_equation_at(self.training_data.x)))))
+            scale_data = 0.0
+            #scale_data = np.sqrt(np.mean(np.square(np.random.normal(0, self.std_set, self.training_data.x.shape[0]))))
+            # TODO can we do this differently without knowing what the training data is?
             noise_dists = []
             for _, _, var_ols, ssqe in cov_estimates:
                 shape = (0.01 + len_data) / 2
                 scale = max((0.01 * var_ols + ssqe) / 2, 1e-12 * scale_data)
                 noise_dists.append(invgamma(shape, scale=scale))
-            noise_pdf, noise_samples = self._get_samples_and_pdf(
+                noise_pdf, noise_samples = self._get_samples_and_pdf(
                 noise_dists, num_samples
-            )
+                    )
 
             param_names.append("std_dev")
             samples = np.concatenate((samples, np.sqrt(noise_samples)), axis=1)
+            #print(samples)
             pdf *= noise_pdf
 
         if self._uniformly_weighted_proposal:
@@ -275,10 +298,14 @@ class SmcpyOptimizer(LocalOptimizer):
 
     def evaluate_model(self, params, individual):
         individual.set_local_optimization_params(params.T)
-        result = self._objective_fn.evaluate_fitness_vector(individual).T
-        if len(result.shape) < 2:
+        #result = self._objective_fn.evaluate_fitness_vector(individual).T
+        #if len(result.shape) < 2:
             # TODO, would it be better to remove the flatten in explicit
             # regression and add a flatten to the scipy wrapper?
-            result = result.reshape(-1, len(self._objective_fn.training_data))
+        #    result = result.reshape(-1, len(self._objective_fn.training_data))
+        #result = self._objective_fn.evaluate_fitness_vector(individual).T
+        #print(result)
+        result = individual.evaluate_equation_at(self.training_data.x).T
+        #print(result)
         return result
 
